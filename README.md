@@ -90,6 +90,16 @@ kubectl -n mongodb logs deployment/mongodb-kubernetes-operator --tail=50
 kubectl -n mongodb describe om ops-manager
 ```
 
+## Troubleshooting
+
+- **The AppDB stays `Pending` while its pods are `Running`.** Normal: the operator marks the AppDB `Running` only
+  after Ops Manager is up. Watch `STATE (OPSMANAGER)` instead.
+- **`ops-manager-0` is in `CrashLoopBackOff`.** Ops Manager's pre-flight check names the reason:
+  `kubectl -n mongodb logs ops-manager-0 --previous | grep -B10 'Pre-flight checks failed'`.
+  After fixing a manifest, re-run the script; it recreates a crash-looping pod that still has an outdated spec
+  (a StatefulSet never replaces a pod that is not Ready).
+- **Watch progress:** `kubectl -n mongodb get om,mdb,pods -w`.
+
 ## Notes and limitations
 
 - The lab runs one kind node, so all pods share one host; the replica set members are not spread across machines.

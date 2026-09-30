@@ -49,14 +49,16 @@ wait_for() {
   return 1
 }
 
-# wait_for_phase <label> <kind> <name> <jsonpath> <tries>: wait until a CR status phase is Running.
+# wait_for_phase <label> <kind> <name> <jsonpath> <tries> [hook]: wait until a CR status phase is Running.
+# The optional hook (a function name) runs before every retry.
 wait_for_phase() {
-  local label=$1 kind=$2 name=$3 path=$4 tries=$5 i phase
+  local label=$1 kind=$2 name=$3 path=$4 tries=$5 hook=${6:-} i phase
   for i in $(seq 1 "$tries"); do
     phase=$(kc get "$kind" "$name" -o "jsonpath=${path}" 2>/dev/null || true)
     echo "  ${label}: ${phase:-pending} (${i}/${tries})"
     [ "$phase" = "Running" ] && return 0
     [ "$phase" = "Failed" ] && [ "$i" -ge 5 ] && { diagnose; die "${label} reported Failed"; }
+    if [ -n "$hook" ]; then "$hook"; fi
     sleep 15
   done
   diagnose
@@ -167,12 +169,25 @@ apply_manifest() {
             ${MONGOD_CACHE_GB} ${RS_NAME} ${MDB_VERSION} ${RS_STORAGE}' < "$1" | kubectl apply -f - >/dev/null
 }
 
+# A StatefulSet never replaces a pod that is not Ready, so a crash-looping Ops Manager pod keeps its old spec
+# after the manifest is fixed. Delete it so it is recreated from the current revision.
+recycle_stale_om_pod() {
+  local pod="${OM_NAME}-0" pod_rev sts_rev reason
+  pod_rev=$(kc get pod "$pod" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+  sts_rev=$(kc get statefulset "$OM_NAME" -o jsonpath='{.status.updateRevision}' 2>/dev/null || true)
+  reason=$(kc get pod "$pod" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+  if [ -n "$pod_rev" ] && [ -n "$sts_rev" ] && [ "$pod_rev" != "$sts_rev" ] && [ "$reason" = "CrashLoopBackOff" ]; then
+    log "${pod} is crash-looping on an outdated spec; recreating it"
+    kc delete pod "$pod" --wait=false >/dev/null
+  fi
+}
+
 deploy_ops_manager() {
   log "Deploying Ops Manager ${OM_VERSION} with a 3-member Enterprise ${APPDB_VERSION} AppDB"
   apply_manifest "${SCRIPT_DIR}/manifests/ops-manager.yaml"
   # The AppDB reports Running only after Ops Manager is up (the operator then enables AppDB monitoring in it).
   log "Waiting for Ops Manager (image pull plus first-start data migration; several minutes)"
-  wait_for_phase "Ops Manager" opsmanagers.mongodb.com "$OM_NAME" '{.status.opsManager.phase}' 90
+  wait_for_phase "Ops Manager" opsmanagers.mongodb.com "$OM_NAME" '{.status.opsManager.phase}' 90 recycle_stale_om_pod
   log "Waiting for the AppDB to finish enabling monitoring"
   wait_for_phase "AppDB" opsmanagers.mongodb.com "$OM_NAME" '{.status.applicationDatabase.phase}' 40
 }
