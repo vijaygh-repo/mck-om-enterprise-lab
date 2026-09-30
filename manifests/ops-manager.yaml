@@ -18,6 +18,9 @@ spec:
     mms.fromEmailAddr: admin@example.com
     mms.replyToEmailAddr: admin@example.com
     mms.adminEmailAddr: admin@example.com
+    mms.mail.transport: smtp
+    mms.mail.hostname: localhost
+    mms.mail.port: "25"
   applicationDatabase:
     members: 3
     version: ${APPDB_VERSION}
