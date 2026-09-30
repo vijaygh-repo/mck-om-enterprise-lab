@@ -170,10 +170,11 @@ apply_manifest() {
 deploy_ops_manager() {
   log "Deploying Ops Manager ${OM_VERSION} with a 3-member Enterprise ${APPDB_VERSION} AppDB"
   apply_manifest "${SCRIPT_DIR}/manifests/ops-manager.yaml"
-  log "Waiting for the AppDB (pulls MongoDB Enterprise images; several minutes)"
-  wait_for_phase "AppDB" opsmanagers.mongodb.com "$OM_NAME" '{.status.applicationDatabase.phase}' 90
-  log "Waiting for Ops Manager"
+  # The AppDB reports Running only after Ops Manager is up (the operator then enables AppDB monitoring in it).
+  log "Waiting for Ops Manager (image pull plus first-start data migration; several minutes)"
   wait_for_phase "Ops Manager" opsmanagers.mongodb.com "$OM_NAME" '{.status.opsManager.phase}' 90
+  log "Waiting for the AppDB to finish enabling monitoring"
+  wait_for_phase "AppDB" opsmanagers.mongodb.com "$OM_NAME" '{.status.applicationDatabase.phase}' 40
 }
 
 # ---------------------------------------------------------------------------
