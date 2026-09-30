@@ -7,12 +7,19 @@
 # Versions and sizing live in config.env. No UI steps are needed.
 #
 # Usage:
-#   ./mck-om-lab.sh          build the lab (re-runs itself with sudo; safe to run again)
-#   ./mck-om-lab.sh stop     shut the lab down cleanly before you stop the EC2 instance
-#   ./mck-om-lab.sh start    bring the existing lab back after the instance was stopped or rebooted
+#   ./mck-om-lab.sh [up]     build the lab, or resume it if it already exists (re-runs itself with sudo)
+#   ./mck-om-lab.sh stop     shut the lab down cleanly, keeping its data, before you stop the EC2 instance
+#   ./mck-om-lab.sh start    bring the lab back after the instance was stopped or rebooted
 #   ./mck-om-lab.sh status   show pods, resource phases and the current login URL
-#   ./mck-om-lab.sh down     remove the lab (same as ./cleanup.sh; it asks first, --yes skips the prompt)
+#   ./mck-om-lab.sh down     DELETE the lab and all its data (same as ./cleanup.sh; it asks first)
 set -Eeuo pipefail
+
+usage() { sed -n '/^# Usage:/,/^set /p' "${BASH_SOURCE[0]}" | grep '^#' | sed 's/^# \{0,1\}//'; }
+case "${1:-up}" in
+  up | start | stop | status | down) ;;
+  -h | --help | help) usage; exit 0 ;;
+  *) usage >&2; exit 1 ;;
+esac
 
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null || { echo "Run this script as root." >&2; exit 1; }
@@ -132,15 +139,19 @@ check_host() {
 # ---------------------------------------------------------------------------
 # Step 1: Docker, kind, kubectl, helm
 # ---------------------------------------------------------------------------
+# kind nodes run many watchers, so the default inotify limits are too low; the file keeps them across reboots.
+apply_sysctl() {
+  printf 'fs.inotify.max_user_watches=524288\nfs.inotify.max_user_instances=512\n' > "$SYSCTL_FILE"
+  sysctl -q -p "$SYSCTL_FILE"
+}
+
 install_docker() {
   log "Installing and starting Docker"
   # curl is intentionally omitted: AL2023 ships curl-minimal, which conflicts with curl.
   dnf install -y docker git jq openssl gettext tar gzip >/dev/null
   systemctl enable --now docker
   docker info >/dev/null 2>&1 || die "Docker is installed but not responding"
-  # kind nodes run many watchers; the default inotify limits are too low for them. Persisted for reboots.
-  printf 'fs.inotify.max_user_watches=524288\nfs.inotify.max_user_instances=512\n' > "$SYSCTL_FILE"
-  sysctl -q -p "$SYSCTL_FILE"
+  apply_sysctl
 }
 
 install_binary() { # <name> <version> <url>
@@ -410,7 +421,7 @@ start_lab() {
   systemctl start docker
   wait_for "Docker" 12 5 docker_ready || die "Docker did not start"
   lab_exists || die "No lab found on this host. Build it with: ./mck-om-lab.sh"
-  [ ! -f "$SYSCTL_FILE" ] || sysctl -q -p "$SYSCTL_FILE"
+  apply_sysctl # a lab built by an older version only set the limits until the next reboot
   start_cluster_if_stopped
 
   OM_ADMIN_PASSWORD=$(kc get secret ops-manager-admin-secret -o jsonpath='{.data.Password}' | base64 -d)
@@ -447,7 +458,6 @@ main() {
     stop) stop_lab ;;
     status) show_status ;;
     down) shift; exec "${SCRIPT_DIR}/cleanup.sh" "$@" ;;
-    *) die "Usage: $0 [up|start|stop|status|down]" ;;
   esac
 }
 

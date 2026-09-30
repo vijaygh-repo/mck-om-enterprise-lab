@@ -59,6 +59,8 @@ cd mck-om-enterprise-lab
 ./mck-om-lab.sh
 ```
 
+Cloned it earlier? Run `git pull` first so you have the current scripts.
+
 The script re-runs itself with `sudo` when needed. The first run takes 15-25 minutes, mostly image pulls and
 Ops Manager's first start. It is safe to re-run: finished steps are skipped. It prints the Ops Manager URL and
 login at the end and saves them to `/root/mck-om-credentials.txt`. All output is also written to
@@ -70,11 +72,11 @@ also checks that host port 8080 is free. An unsuitable host therefore fails in s
 
 | Command | What it does |
 | --- | --- |
-| `./mck-om-lab.sh` | build the lab (or resume it; safe to run again) |
+| `./mck-om-lab.sh` | build the lab, or resume it if it already exists (safe to run again) |
 | `./mck-om-lab.sh stop` | shut the lab down cleanly before you stop the EC2 instance |
 | `./mck-om-lab.sh start` | bring the existing lab back after the instance was stopped or rebooted |
 | `./mck-om-lab.sh status` | pods, resource phases and the current login URL |
-| `./cleanup.sh` | remove the whole lab (`./mck-om-lab.sh down` is the same command) |
+| `./cleanup.sh` | delete the whole lab and all its data (`./mck-om-lab.sh down` is the same command) |
 
 Override any value from `config.env` in the environment, for example
 `MDB_VERSION=8.0.32-ent ./mck-om-lab.sh` to deploy MongoDB 8.0 instead of 9.0.
@@ -151,7 +153,8 @@ sudo kind export kubeconfig --name mck-lab
 sudo kubectl -n mongodb get om,mdb,pods -w      # wait until everything is Running
 ```
 
-Do not run `kind delete cluster` or `docker rm` on the node to "restart" the lab: that deletes all of its data.
+Do not use `./mck-om-lab.sh down`, `./cleanup.sh`, `kind delete cluster` or `docker rm` to "restart" the lab: they
+delete all of its data. Use `stop` and `start` to switch it off and on.
 
 ## Removing the lab
 
@@ -189,6 +192,8 @@ kubectl -n mongodb describe om ops-manager
   After fixing a manifest, re-run the script; it recreates a crash-looping pod that still has an outdated spec
   (a StatefulSet never replaces a pod that is not Ready).
 - **Watch progress:** `kubectl -n mongodb get om,mdb,pods -w`.
+- **`./mck-om-lab.sh stop` prints a usage line that has no `stop` or `start`.** The clone is out of date; run
+  `git pull` in the repository and try again.
 - **The lab is not back after the instance was started.** Run `./mck-om-lab.sh start` again; it is safe to repeat.
   `docker ps -a` shows whether the node container `mck-lab-control-plane` exists and is running, and
   `./mck-om-lab.sh status` shows the pods. If the pods are not Ready after 20 minutes, `start` prints diagnostics.
