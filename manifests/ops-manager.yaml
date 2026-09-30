@@ -1,0 +1,32 @@
+apiVersion: mongodb.com/v1
+kind: MongoDBOpsManager
+metadata:
+  name: ${OM_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  version: ${OM_VERSION}
+  adminCredentials: ops-manager-admin-secret
+  externalConnectivity:
+    type: NodePort
+    port: ${OM_NODEPORT}
+  jvmParameters:
+    - -Xms1g
+    - -Xmx${OM_HEAP}
+  configuration:
+    mms.ignoreInitialUiSetup: "true"
+    mms.fromEmailAddr: admin@example.com
+    mms.replyToEmailAddr: admin@example.com
+    mms.adminEmailAddr: admin@example.com
+  applicationDatabase:
+    members: 3
+    version: ${APPDB_VERSION}
+    podSpec:
+      persistence:
+        single:
+          storage: ${APPDB_STORAGE}
+    additionalMongodConfig:
+      storage:
+        wiredTiger:
+          engineConfig:
+            cacheSizeGB: ${MONGOD_CACHE_GB}
