@@ -10,7 +10,8 @@ One script builds, on a single EC2 instance:
 6. A 3-member **MongoDB Enterprise 9.0.2** replica set managed by that Ops Manager
 
 It follows the "Installing Kind cluster" and "Ops Manager Installation" steps of the Operator hands-on
-practice lab, updated to current versions and fully automated.
+practice lab, updated to current versions and fully automated. Verified end to end on an Amazon Linux 2023
+x86_64 host with 16 GiB of RAM.
 
 ```mermaid
 flowchart TB
@@ -55,18 +56,26 @@ Set in [config.env](config.env); every value can be overridden from the environm
 ```bash
 git clone https://github.com/vijaygh-repo/mck-om-enterprise-lab.git
 cd mck-om-enterprise-lab
-sudo ./mck-om-lab.sh
+./mck-om-lab.sh
 ```
 
-The first run takes 15-25 minutes, mostly image pulls and Ops Manager's first start. The script is safe
-to re-run: finished steps are skipped. It prints the Ops Manager URL and login at the end and saves them to
-`/root/mck-om-credentials.txt`.
+The script re-runs itself with `sudo` when needed. The first run takes 15-25 minutes, mostly image pulls and
+Ops Manager's first start. It is safe to re-run: finished steps are skipped. It prints the Ops Manager URL and
+login at the end and saves them to `/root/mck-om-credentials.txt`. All output is also written to
+`/var/log/mck-om-lab.log`.
+
+Before installing anything, the script checks that the host is x86_64 with about 16 GiB of RAM and 20 GiB of
+free disk, and that Docker Hub, quay.io, downloads.mongodb.com and the other download sites are reachable. It
+also checks that host port 8080 is free. An unsuitable host therefore fails in seconds with a clear message.
 
 | Command | What it does |
 | --- | --- |
-| `sudo ./mck-om-lab.sh` | build the lab |
-| `sudo ./mck-om-lab.sh status` | pods and resource phases |
-| `sudo ./mck-om-lab.sh down` | delete the kind cluster |
+| `./mck-om-lab.sh` | build the lab |
+| `./mck-om-lab.sh status` | pods and resource phases |
+| `./mck-om-lab.sh down` | delete the kind cluster and the saved credentials |
+
+Override any value from `config.env` in the environment, for example
+`MDB_VERSION=8.0.32-ent ./mck-om-lab.sh` to deploy MongoDB 8.0 instead of 9.0.
 
 ## Logging in
 
@@ -81,6 +90,21 @@ to re-run: finished steps are skipped. It prints the Ops Manager URL and login a
   global API key in the secret `mongodb-ops-manager-admin-key`.
 - The script uses that key to create the project through the Ops Manager API, then writes the
   `my-credentials` secret and the `my-project` ConfigMap that the `MongoDB` resource refers to.
+
+## Design notes
+
+These are the problems found while building the lab, and how the script handles them:
+
+- **Ops Manager first, then the AppDB.** The operator reports the AppDB `Running` only after Ops Manager is up,
+  so the script waits for Ops Manager first.
+- **Mail settings.** `mms.ignoreInitialUiSetup` makes Ops Manager validate its properties at start; without
+  `mms.mail.hostname` (and transport and port) the pre-flight check fails and the pod crash-loops.
+- **Stale crash-looping pod.** A StatefulSet never replaces a pod that is not Ready, so after a manifest fix the
+  script deletes an Ops Manager pod that is crash-looping on an outdated revision.
+- **Memory.** The operator limits the Ops Manager pod to 5 GB; the JVM heap and every `mongod` cache are capped
+  so everything fits on a 16 GiB host.
+- **Pinned Kubernetes 1.34.** kind's default is Kubernetes 1.37, newer than anything MCK 1.13.0 documents.
+- **`sudo` and `PATH`.** `/usr/local/bin` is added to `PATH` because `sudo` drops it.
 
 ## Useful commands
 
@@ -99,6 +123,9 @@ kubectl -n mongodb describe om ops-manager
   After fixing a manifest, re-run the script; it recreates a crash-looping pod that still has an outdated spec
   (a StatefulSet never replaces a pod that is not Ready).
 - **Watch progress:** `kubectl -n mongodb get om,mdb,pods -w`.
+- **A run stopped part-way.** Run `./mck-om-lab.sh` again; it resumes. When a wait fails it prints diagnostics
+  (pods, events, the Ops Manager pre-flight reason, operator logs), and everything is in
+  `/var/log/mck-om-lab.log`.
 
 ## Notes and limitations
 
@@ -107,5 +134,3 @@ kubectl -n mongodb describe om ops-manager
 - Backup is not configured. Add `spec.backup` to the `MongoDBOpsManager` resource for that.
 - Memory is capped for a 16 GiB host: Ops Manager heap `3g`, WiredTiger cache `0.25` GB per `mongod`. Raise
   `OM_HEAP` and `MONGOD_CACHE_GB` in `config.env` on a bigger instance.
-- MongoDB 9.0.2 and Ops Manager 9.0.0 are new. If the replica set does not deploy, retry with
-  `MDB_VERSION=8.0.32-ent sudo -E ./mck-om-lab.sh`.

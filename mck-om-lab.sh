@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # mck-om-lab.sh
 #
-# One-command lab on a single EC2 host (Amazon Linux 2023, x86_64, >= 16 GiB RAM), run as root:
+# One-command lab on a single EC2 host (Amazon Linux 2023, x86_64, >= 16 GiB RAM):
 #   docker -> kind cluster -> MongoDB Controllers for Kubernetes (MCK) -> Ops Manager
 #   -> a 3-member MongoDB Enterprise replica set managed by that Ops Manager.
-# Versions live in config.env. No UI steps are needed.
+# Versions and sizing live in config.env. No UI steps are needed.
 #
 # Usage:
-#   sudo ./mck-om-lab.sh          build the lab (safe to re-run)
-#   sudo ./mck-om-lab.sh status   show pods and resource phases
-#   sudo ./mck-om-lab.sh down     delete the kind cluster
+#   ./mck-om-lab.sh          build the lab (re-runs itself with sudo; safe to run again)
+#   ./mck-om-lab.sh status   show pods and resource phases
+#   ./mck-om-lab.sh down     delete the kind cluster
 set -Eeuo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  command -v sudo >/dev/null || { echo "Run this script as root." >&2; exit 1; }
+  exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+fi
+
 trap 'echo "ERROR: line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,11 +27,16 @@ set -a
 source "${SCRIPT_DIR}/config.env"
 set +a
 
+LOG_FILE="${LOG_FILE:-/var/log/mck-om-lab.log}"
 CREDS_FILE="/root/mck-om-credentials.txt"
-OM_LOCAL_URL="http://127.0.0.1:${OM_HOST_PORT}"
-OM_API="${OM_LOCAL_URL}/api/public/v1.0"
+OM_API="http://127.0.0.1:${OM_HOST_PORT}/api/public/v1.0"
 OM_ADMIN_KEY_SECRET="${NAMESPACE}-${OM_NAME}-admin-key" # created by the operator once Ops Manager is up
 export KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
+
+# Only these variables are substituted into the templates under kind-config.yaml and manifests/.
+# shellcheck disable=SC2016 # envsubst needs the literal ${VAR} names
+TEMPLATE_VARS='${NAMESPACE} ${OM_NAME} ${OM_VERSION} ${OM_NODEPORT} ${OM_HOST_PORT} ${OM_HEAP} ${APPDB_VERSION}
+  ${APPDB_STORAGE} ${MONGOD_CACHE_GB} ${RS_NAME} ${MDB_VERSION} ${RS_STORAGE}'
 
 # Populated at runtime.
 API_PUBLIC_KEY="" API_PRIVATE_KEY="" GROUP_ID="" ORG_ID="" PUBLIC_IP="" OM_ADMIN_PASSWORD=""
@@ -52,12 +63,14 @@ wait_for() {
 # wait_for_phase <label> <kind> <name> <jsonpath> <tries> [hook]: wait until a CR status phase is Running.
 # The optional hook (a function name) runs before every retry.
 wait_for_phase() {
-  local label=$1 kind=$2 name=$3 path=$4 tries=$5 hook=${6:-} i phase
+  local label=$1 kind=$2 name=$3 path=$4 tries=$5 hook=${6:-} i phase failed=0
   for i in $(seq 1 "$tries"); do
     phase=$(kc get "$kind" "$name" -o "jsonpath=${path}" 2>/dev/null || true)
     echo "  ${label}: ${phase:-pending} (${i}/${tries})"
     [ "$phase" = "Running" ] && return 0
-    [ "$phase" = "Failed" ] && [ "$i" -ge 5 ] && { diagnose; die "${label} reported Failed"; }
+    # The operator reports Failed while it retries, so give up only if it persists.
+    if [ "$phase" = "Failed" ]; then failed=$((failed + 1)); else failed=0; fi
+    if [ "$failed" -ge 8 ]; then diagnose; die "${label} has reported Failed for $((failed * 15))s"; fi
     if [ -n "$hook" ]; then "$hook"; fi
     sleep 15
   done
@@ -66,24 +79,50 @@ wait_for_phase() {
 }
 
 diagnose() {
-  echo "--- diagnostics ---" >&2
-  kc get pods,opsmanagers.mongodb.com,mongodb.mongodb.com 2>&1 | head -30 >&2 || true
-  kc describe opsmanagers.mongodb.com "$OM_NAME" 2>&1 | grep -A15 '^Status:' >&2 || true
-  kc logs deployment/mongodb-kubernetes-operator --tail=25 >&2 2>&1 || true
+  {
+    echo "--- diagnostics ---"
+    kc get pods,opsmanagers.mongodb.com,mongodb.mongodb.com 2>&1 | head -30
+    kc describe opsmanagers.mongodb.com "$OM_NAME" 2>&1 | grep -A15 '^Status:'
+    kc get events --sort-by=.lastTimestamp 2>&1 | tail -10 | cut -c1-300
+    # Ops Manager names the failing pre-flight check just above this message.
+    kc logs "${OM_NAME}-0" --previous --tail=400 2>/dev/null | grep -B10 'Pre-flight checks failed' | cut -c1-400 | tail -14
+    kc logs deployment/mongodb-kubernetes-operator --tail=25 2>&1 | cut -c1-300
+  } >&2 || true
 }
 
 # Ops Manager API call authenticated with the operator-created global API key.
 om_api() { curl --fail-with-body -sS --digest -u "${API_PUBLIC_KEY}:${API_PRIVATE_KEY}" "$@"; }
 
-require_root() { [ "$(id -u)" -eq 0 ] || die "Run this script as root (sudo ./mck-om-lab.sh)"; }
+# Render a template with only the lab's variables substituted.
+render() { envsubst "$TEMPLATE_VARS" < "$1"; }
+apply_manifest() { render "$1" | kubectl apply -f - >/dev/null; }
+
+# ---------------------------------------------------------------------------
+# Step 0: fail fast on an unsuitable host
+# ---------------------------------------------------------------------------
+reachable() {
+  local code
+  code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$1" || true)
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
 
 check_host() {
   [ "$(uname -m)" = "x86_64" ] || die "x86_64 is required: the Ops Manager container image is linux/amd64 only."
-  local mem_kb
+
+  local mem_kb disk_gb url
   mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
   if [ "$mem_kb" -lt 15000000 ] && [ "${SKIP_RESOURCE_CHECK:-0}" != "1" ]; then
     die "This lab needs about 16 GiB of RAM (found $((mem_kb / 1024 / 1024)) GiB). Set SKIP_RESOURCE_CHECK=1 to ignore."
   fi
+  disk_gb=$(df -PBG / | awk 'NR==2 {gsub("G", "", $4); print $4}')
+  if [ "$disk_gb" -lt 20 ] && [ "${SKIP_RESOURCE_CHECK:-0}" != "1" ]; then
+    die "Only ${disk_gb} GiB of disk is free on /; the container images alone need about 15 GiB (50 GiB recommended)."
+  fi
+
+  for url in https://registry-1.docker.io/v2/ https://quay.io/v2/ https://dl.k8s.io https://kind.sigs.k8s.io \
+    https://mongodb.github.io/helm-charts/index.yaml https://raw.githubusercontent.com https://downloads.mongodb.com; do
+    reachable "$url" || die "Cannot reach ${url}. The host needs outbound internet access."
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -99,24 +138,23 @@ install_docker() {
   sysctl -w fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=512 >/dev/null
 }
 
-install_kind() {
-  if command -v kind >/dev/null && kind version | grep -q "${KIND_VERSION}"; then return 0; fi
-  log "Installing kind ${KIND_VERSION}"
-  curl -fsSLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-  chmod +x /usr/local/bin/kind
+install_binary() { # <name> <version> <url>
+  log "Installing $1 $2"
+  curl -fsSLo "/usr/local/bin/$1" "$3"
+  chmod +x "/usr/local/bin/$1"
 }
 
-install_kubectl() {
-  if command -v kubectl >/dev/null && kubectl version --client 2>/dev/null | grep -q "${KUBECTL_VERSION}"; then return 0; fi
-  log "Installing kubectl ${KUBECTL_VERSION}"
-  curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-  chmod +x /usr/local/bin/kubectl
-}
-
-install_helm() {
-  command -v helm >/dev/null && return 0
-  log "Installing helm"
-  curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null
+install_tools() {
+  if ! { command -v kind >/dev/null && kind version | grep -q "${KIND_VERSION}"; }; then
+    install_binary kind "$KIND_VERSION" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+  fi
+  if ! { command -v kubectl >/dev/null && kubectl version --client 2>/dev/null | grep -q "${KUBECTL_VERSION}"; }; then
+    install_binary kubectl "$KUBECTL_VERSION" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+  fi
+  if ! command -v helm >/dev/null; then
+    log "Installing helm"
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -126,9 +164,15 @@ create_cluster() {
   if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER_NAME"; then
     log "kind cluster '${KIND_CLUSTER_NAME}' already exists"
   else
+    if ss -ltn | awk '{print $4}' | grep -q ":${OM_HOST_PORT}\$"; then
+      die "Host port ${OM_HOST_PORT} is already in use; free it or set OM_HOST_PORT in config.env."
+    fi
+    local kind_config
+    kind_config=$(mktemp)
+    render "${SCRIPT_DIR}/kind-config.yaml" > "$kind_config"
     log "Creating kind cluster '${KIND_CLUSTER_NAME}' (${KIND_NODE_IMAGE})"
-    kind create cluster --name "$KIND_CLUSTER_NAME" --config "${SCRIPT_DIR}/kind-config.yaml" \
-      --image "$KIND_NODE_IMAGE" --wait 180s
+    kind create cluster --name "$KIND_CLUSTER_NAME" --config "$kind_config" --image "$KIND_NODE_IMAGE" --wait 180s
+    rm -f "$kind_config"
   fi
   kubectl config use-context "kind-${KIND_CLUSTER_NAME}" >/dev/null
   kubectl get nodes -o wide
@@ -148,7 +192,7 @@ install_operator() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4: Ops Manager (3-member AppDB, Enterprise)
+# Step 4: Ops Manager (3-member Enterprise AppDB)
 # ---------------------------------------------------------------------------
 create_admin_secret() {
   if kc get secret ops-manager-admin-secret >/dev/null 2>&1; then
@@ -160,13 +204,6 @@ create_admin_secret() {
   kc create secret generic ops-manager-admin-secret \
     --from-literal=Username="$OM_ADMIN_USER" --from-literal=Password="$OM_ADMIN_PASSWORD" \
     --from-literal=FirstName="Ops" --from-literal=LastName="Admin" >/dev/null
-}
-
-# Render a manifest with only the lab's variables substituted, then apply it.
-# shellcheck disable=SC2016 # envsubst needs the literal ${VAR} list
-apply_manifest() {
-  envsubst '${NAMESPACE} ${OM_NAME} ${OM_VERSION} ${OM_NODEPORT} ${OM_HEAP} ${APPDB_VERSION} ${APPDB_STORAGE}
-            ${MONGOD_CACHE_GB} ${RS_NAME} ${MDB_VERSION} ${RS_STORAGE}' < "$1" | kubectl apply -f - >/dev/null
 }
 
 # A StatefulSet never replaces a pod that is not Ready, so a crash-looping Ops Manager pod keeps its old spec
@@ -193,7 +230,7 @@ deploy_ops_manager() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 5: project + credentials for the operator, with no UI steps
+# Step 5: project and credentials for the operator, with no UI steps
 # ---------------------------------------------------------------------------
 admin_key_ready() {
   API_PUBLIC_KEY=$(kc get secret "$OM_ADMIN_KEY_SECRET" -o jsonpath='{.data.publicKey}' 2>/dev/null | base64 -d)
@@ -266,7 +303,7 @@ EOF
   cat <<EOF
 
 ===================================================================
-MCK + Ops Manager lab is up.
+MCK + Ops Manager lab is up (finished in $((SECONDS / 60)) min).
 
 HOW TO LOG IN:
   1. Open http://${PUBLIC_IP}:${OM_HOST_PORT} (port ${OM_HOST_PORT} must be open in the security group)
@@ -282,19 +319,22 @@ HOW TO LOG IN:
   Deployment:   ${RS_NAME}, MongoDB Enterprise ${MDB_VERSION} (3 members)
 
   Useful:  kubectl -n ${NAMESPACE} get om,mdb,pods
-  Remove:  sudo ./mck-om-lab.sh down
+  Log:     ${LOG_FILE}
+  Remove:  ./mck-om-lab.sh down
 ===================================================================
 EOF
 }
 
 # ---------------------------------------------------------------------------
 build() {
-  require_root
+  # The log contains the generated admin password, so keep it readable by root only.
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  log "Starting; output is also written to ${LOG_FILE}"
   check_host
   install_docker
-  install_kind
-  install_kubectl
-  install_helm
+  install_tools
   create_cluster
   install_operator
   create_admin_secret
@@ -304,12 +344,17 @@ build() {
   print_summary
 }
 
-case "${1:-up}" in
-  up | "") build ;;
-  status) kc get pods,opsmanagers.mongodb.com,mongodb.mongodb.com ;;
-  down)
-    require_root
-    kind delete cluster --name "$KIND_CLUSTER_NAME"
-    ;;
-  *) die "Usage: $0 [up|status|down]" ;;
-esac
+main() {
+  case "${1:-up}" in
+    up) build ;;
+    status) kc get pods,opsmanagers.mongodb.com,mongodb.mongodb.com ;;
+    down)
+      kind delete cluster --name "$KIND_CLUSTER_NAME"
+      rm -f "$CREDS_FILE"
+      ;;
+    *) die "Usage: $0 [up|status|down]" ;;
+  esac
+}
+
+# Run only when executed, so the functions can be sourced for testing.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
