@@ -70,9 +70,11 @@ also checks that host port 8080 is free. An unsuitable host therefore fails in s
 
 | Command | What it does |
 | --- | --- |
-| `./mck-om-lab.sh` | build the lab |
-| `./mck-om-lab.sh status` | pods and resource phases |
-| `./mck-om-lab.sh down` | delete the kind cluster and the saved credentials |
+| `./mck-om-lab.sh` | build the lab (or resume it; safe to run again) |
+| `./mck-om-lab.sh stop` | shut the lab down cleanly before you stop the EC2 instance |
+| `./mck-om-lab.sh start` | bring the existing lab back after the instance was stopped or rebooted |
+| `./mck-om-lab.sh status` | pods, resource phases and the current login URL |
+| `./cleanup.sh` | remove the whole lab (`./mck-om-lab.sh down` is the same command) |
 
 Override any value from `config.env` in the environment, for example
 `MDB_VERSION=8.0.32-ent ./mck-om-lab.sh` to deploy MongoDB 8.0 instead of 9.0.
@@ -105,6 +107,70 @@ These are the problems found while building the lab, and how the script handles 
   so everything fits on a 16 GiB host.
 - **Pinned Kubernetes 1.34.** kind's default is Kubernetes 1.37, newer than anything MCK 1.13.0 documents.
 - **`sudo` and `PATH`.** `/usr/local/bin` is added to `PATH` because `sudo` drops it.
+- **Instance stop/start.** The kind node is a Docker container that is stopped with the instance. `start` starts it
+  again, regenerates the kubeconfig (Docker can publish the API server on a different host port), and treats a pod
+  as Ready only if its container started after the node did, so statuses left over from before the shutdown are
+  ignored. The kernel `inotify` limits kind needs are persisted in `/etc/sysctl.d/99-mck-lab.conf`.
+
+## Stopping and starting the EC2 instance
+
+The lab survives an instance stop and start. The kind node is a Docker container whose data lives on the
+instance's EBS volume, so nothing has to be rebuilt.
+
+**Before stopping the instance** (recommended; the MongoDB processes get a SIGTERM and time to shut down
+cleanly, which takes 1-2 minutes):
+
+```bash
+cd ~/mck-om-enterprise-lab
+./mck-om-lab.sh stop
+```
+
+Then stop the instance in the AWS console or CLI. Stopping it without this step also works, because MongoDB
+recovers from its journal.
+
+**After starting the instance:**
+
+1. SSH in. The public IP changes on every start unless the instance has an Elastic IP.
+2. Bring the lab back:
+
+   ```bash
+   cd ~/mck-om-enterprise-lab
+   ./mck-om-lab.sh start
+   ```
+
+   This starts Docker and the kind node, waits for every pod to be `Ready` (usually 5-10 minutes), and prints
+   the current Ops Manager URL and login. Update your browser bookmark or SSH tunnel with the new IP.
+3. Check it at any time with `./mck-om-lab.sh status`.
+
+Running plain `./mck-om-lab.sh` also resumes an existing lab. The manual equivalent of `start` is:
+
+```bash
+sudo systemctl start docker
+sudo docker start mck-lab-control-plane
+sudo kind export kubeconfig --name mck-lab
+sudo kubectl -n mongodb get om,mdb,pods -w      # wait until everything is Running
+```
+
+Do not run `kind delete cluster` or `docker rm` on the node to "restart" the lab: that deletes all of its data.
+
+## Removing the lab
+
+```bash
+./cleanup.sh            # asks you to type 'delete' first (./mck-om-lab.sh down does the same)
+./cleanup.sh --yes      # no confirmation
+./cleanup.sh --purge    # also remove kind, kubectl, helm, their caches and the kind node image
+```
+
+By default this deletes the kind cluster (Ops Manager, the AppDB, `my-replica-set` and **all their data**),
+the saved credentials, the log file and the kernel-settings file. Docker and the base packages stay
+installed; to remove Docker as well:
+
+```bash
+sudo systemctl disable --now docker && sudo dnf remove -y docker
+```
+
+Terminating the EC2 instance removes everything at once. The cloned repository itself is not touched; delete it
+with `rm -rf ~/mck-om-enterprise-lab` when it is no longer needed.
 
 ## Useful commands
 
@@ -123,6 +189,10 @@ kubectl -n mongodb describe om ops-manager
   After fixing a manifest, re-run the script; it recreates a crash-looping pod that still has an outdated spec
   (a StatefulSet never replaces a pod that is not Ready).
 - **Watch progress:** `kubectl -n mongodb get om,mdb,pods -w`.
+- **The lab is not back after the instance was started.** Run `./mck-om-lab.sh start` again; it is safe to repeat.
+  `docker ps -a` shows whether the node container `mck-lab-control-plane` exists and is running, and
+  `./mck-om-lab.sh status` shows the pods. If the pods are not Ready after 20 minutes, `start` prints diagnostics.
+  The URL changes with the public IP; `start` and `status` print the current one.
 - **A run stopped part-way.** Run `./mck-om-lab.sh` again; it resumes. When a wait fails it prints diagnostics
   (pods, events, the Ops Manager pre-flight reason, operator logs), and everything is in
   `/var/log/mck-om-lab.log`.

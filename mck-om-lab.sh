@@ -8,8 +8,10 @@
 #
 # Usage:
 #   ./mck-om-lab.sh          build the lab (re-runs itself with sudo; safe to run again)
-#   ./mck-om-lab.sh status   show pods and resource phases
-#   ./mck-om-lab.sh down     delete the kind cluster
+#   ./mck-om-lab.sh stop     shut the lab down cleanly before you stop the EC2 instance
+#   ./mck-om-lab.sh start    bring the existing lab back after the instance was stopped or rebooted
+#   ./mck-om-lab.sh status   show pods, resource phases and the current login URL
+#   ./mck-om-lab.sh down     remove the lab (same as ./cleanup.sh; it asks first, --yes skips the prompt)
 set -Eeuo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -29,6 +31,8 @@ set +a
 
 LOG_FILE="${LOG_FILE:-/var/log/mck-om-lab.log}"
 CREDS_FILE="/root/mck-om-credentials.txt"
+SYSCTL_FILE="/etc/sysctl.d/99-mck-lab.conf"
+KIND_NODE="${KIND_CLUSTER_NAME}-control-plane"
 OM_API="http://127.0.0.1:${OM_HOST_PORT}/api/public/v1.0"
 OM_ADMIN_KEY_SECRET="${NAMESPACE}-${OM_NAME}-admin-key" # created by the operator once Ops Manager is up
 export KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
@@ -39,7 +43,7 @@ TEMPLATE_VARS='${NAMESPACE} ${OM_NAME} ${OM_VERSION} ${OM_NODEPORT} ${OM_HOST_PO
   ${APPDB_STORAGE} ${MONGOD_CACHE_GB} ${RS_NAME} ${MDB_VERSION} ${RS_STORAGE}'
 
 # Populated at runtime.
-API_PUBLIC_KEY="" API_PRIVATE_KEY="" GROUP_ID="" ORG_ID="" PUBLIC_IP="" OM_ADMIN_PASSWORD=""
+API_PUBLIC_KEY="" API_PRIVATE_KEY="" GROUP_ID="" ORG_ID="" PUBLIC_IP="" OM_ADMIN_PASSWORD="" NODE_STARTED=0
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -134,8 +138,9 @@ install_docker() {
   dnf install -y docker git jq openssl gettext tar gzip >/dev/null
   systemctl enable --now docker
   docker info >/dev/null 2>&1 || die "Docker is installed but not responding"
-  # kind nodes run many watchers; the default inotify limits are too low for them.
-  sysctl -w fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=512 >/dev/null
+  # kind nodes run many watchers; the default inotify limits are too low for them. Persisted for reboots.
+  printf 'fs.inotify.max_user_watches=524288\nfs.inotify.max_user_instances=512\n' > "$SYSCTL_FILE"
+  sysctl -q -p "$SYSCTL_FILE"
 }
 
 install_binary() { # <name> <version> <url>
@@ -160,9 +165,25 @@ install_tools() {
 # ---------------------------------------------------------------------------
 # Step 2: kind cluster
 # ---------------------------------------------------------------------------
+api_ready() { kubectl get nodes >/dev/null 2>&1; }
+
+# After an EC2 stop/start or a reboot the kind node container is stopped, and Docker may publish the API
+# server on a different host port, so the kubeconfig is regenerated each time.
+start_cluster_if_stopped() {
+  if [ "$(docker inspect -f '{{.State.Running}}' "$KIND_NODE" 2>/dev/null)" = "false" ]; then
+    log "Starting the stopped kind node ${KIND_NODE}"
+    docker start "$KIND_NODE" >/dev/null
+    NODE_STARTED=1
+  fi
+  kind export kubeconfig --name "$KIND_CLUSTER_NAME" >/dev/null 2>&1
+  kubectl config use-context "kind-${KIND_CLUSTER_NAME}" >/dev/null
+  wait_for "the Kubernetes API" 36 5 api_ready || die "The Kubernetes API did not come back after starting ${KIND_NODE}"
+}
+
 create_cluster() {
   if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER_NAME"; then
     log "kind cluster '${KIND_CLUSTER_NAME}' already exists"
+    start_cluster_if_stopped
   else
     if ss -ltn | awk '{print $4}' | grep -q ":${OM_HOST_PORT}\$"; then
       die "Host port ${OM_HOST_PORT} is already in use; free it or set OM_HOST_PORT in config.env."
@@ -320,22 +341,30 @@ HOW TO LOG IN:
 
   Useful:  kubectl -n ${NAMESPACE} get om,mdb,pods
   Log:     ${LOG_FILE}
-  Remove:  ./mck-om-lab.sh down
+  Before stopping the EC2 instance:   ./mck-om-lab.sh stop
+  After starting the instance again:  ./mck-om-lab.sh start   (the public IP changes; it prints the new URL)
+  Remove everything:                  ./cleanup.sh   (--purge also removes kind, kubectl and helm)
 ===================================================================
 EOF
 }
 
 # ---------------------------------------------------------------------------
-build() {
+setup_logging() {
   # The log contains the generated admin password, so keep it readable by root only.
   touch "$LOG_FILE"
   chmod 600 "$LOG_FILE"
   exec > >(tee -a "$LOG_FILE") 2>&1
-  log "Starting; output is also written to ${LOG_FILE}"
+  log "Output is also written to ${LOG_FILE}"
+}
+
+build() {
+  setup_logging
   check_host
   install_docker
   install_tools
   create_cluster
+  # The status of every resource is stale right after a restart, so wait for the pods before trusting it.
+  if [ "$NODE_STARTED" = 1 ] && [ -n "$(kc get pods -o name 2>/dev/null)" ]; then wait_lab_ready; fi
   install_operator
   create_admin_secret
   deploy_ops_manager
@@ -344,15 +373,81 @@ build() {
   print_summary
 }
 
+# ---------------------------------------------------------------------------
+# Stop and start: keep the lab across an EC2 stop/start or a reboot
+# ---------------------------------------------------------------------------
+lab_exists() { docker inspect "$KIND_NODE" >/dev/null 2>&1; }
+docker_ready() { docker info >/dev/null 2>&1; }
+
+# True once every container of every pod is running, ready, and was started after the kind node itself.
+# The last condition keeps pod statuses left over from before the shutdown from counting as ready.
+lab_pods_ready() {
+  local node_started
+  node_started=$(docker inspect -f '{{.State.StartedAt}}' "$KIND_NODE")
+  kc get pods -o json | jq -e --arg t "$node_started" '
+    (.items | length) > 0 and
+    all(.items[]; (.status.containerStatuses // []) as $cs
+      | ($cs | length) > 0 and all($cs[]; .ready == true and (.state.running.startedAt // "") > $t))' >/dev/null
+}
+
+# Any of these answers means Ops Manager is serving on the published port (the API root asks for credentials).
+om_http_ready() {
+  local code
+  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:${OM_HOST_PORT}/" || true)
+  case "$code" in 200 | 401 | 30[1-8]) return 0 ;; esac
+  return 1
+}
+
+wait_lab_ready() {
+  log "Waiting for every pod (operator, Ops Manager, AppDB, ${RS_NAME}) to be Ready; several minutes"
+  wait_for "the pods to be Ready" 80 15 lab_pods_ready || { diagnose; die "The lab pods did not all become Ready"; }
+  wait_for "Ops Manager on port ${OM_HOST_PORT}" 20 10 om_http_ready || die "Ops Manager is not answering on port ${OM_HOST_PORT}"
+}
+
+start_lab() {
+  setup_logging
+  log "Bringing the existing lab back up"
+  systemctl start docker
+  wait_for "Docker" 12 5 docker_ready || die "Docker did not start"
+  lab_exists || die "No lab found on this host. Build it with: ./mck-om-lab.sh"
+  [ ! -f "$SYSCTL_FILE" ] || sysctl -q -p "$SYSCTL_FILE"
+  start_cluster_if_stopped
+
+  OM_ADMIN_PASSWORD=$(kc get secret ops-manager-admin-secret -o jsonpath='{.data.Password}' | base64 -d)
+  wait_lab_ready
+  print_summary
+}
+
+# Stop the kind node with a long grace period so the MongoDB processes shut down cleanly.
+stop_lab() {
+  docker_ready || die "Docker is not running, so the lab is already stopped."
+  lab_exists || die "No lab found on this host."
+  log "Stopping the lab; this takes 1-2 minutes while Ops Manager, the AppDB and ${RS_NAME} shut down"
+  docker stop --time 180 "$KIND_NODE" >/dev/null
+  log "Stopped. The data is kept. You can now stop the EC2 instance; after starting it again run: ./mck-om-lab.sh start"
+}
+
+show_status() {
+  docker_ready || die "Docker is not running. Bring the lab back with: ./mck-om-lab.sh start"
+  lab_exists || die "No lab found on this host. Build it with: ./mck-om-lab.sh"
+  if [ "$(docker inspect -f '{{.State.Running}}' "$KIND_NODE")" != "true" ]; then
+    die "The lab is stopped. Bring it back with: ./mck-om-lab.sh start"
+  fi
+  kind export kubeconfig --name "$KIND_CLUSTER_NAME" >/dev/null 2>&1 || true
+  kc get pods,opsmanagers.mongodb.com,mongodb.mongodb.com
+  detect_public_ip
+  echo
+  echo "Ops Manager: http://${PUBLIC_IP}:${OM_HOST_PORT}   (username and password: ${CREDS_FILE})"
+}
+
 main() {
   case "${1:-up}" in
     up) build ;;
-    status) kc get pods,opsmanagers.mongodb.com,mongodb.mongodb.com ;;
-    down)
-      kind delete cluster --name "$KIND_CLUSTER_NAME"
-      rm -f "$CREDS_FILE"
-      ;;
-    *) die "Usage: $0 [up|status|down]" ;;
+    start) start_lab ;;
+    stop) stop_lab ;;
+    status) show_status ;;
+    down) shift; exec "${SCRIPT_DIR}/cleanup.sh" "$@" ;;
+    *) die "Usage: $0 [up|start|stop|status|down]" ;;
   esac
 }
 
